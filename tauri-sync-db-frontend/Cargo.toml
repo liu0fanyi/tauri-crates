@@ -1,0 +1,15 @@
+[package]
+name = "tauri-sync-db-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Frontend UI components - WASM only
+leptos = { version = "0.8", features = ["csr"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+web-sys = { version = "0.3", features = ["console"] }

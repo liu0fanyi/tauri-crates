@@ -1,0 +1,19 @@
+[package]
+name = "rolling-logger"
+version = "0.1.0"
+edition = "2021"
+description = "A rolling file logger with circular buffer for Tauri applications"
+authors = ["you"]
+license = "MIT"
+
+[dependencies]
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+
+[dev-dependencies]
+tempfile = "3"

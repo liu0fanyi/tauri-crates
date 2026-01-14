@@ -1,0 +1,11 @@
+[package]
+name = "leptos-dragdrop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["Window", "Document", "MouseEvent", "HtmlElement", "HtmlInputElement", "HtmlButtonElement", "DomRect", "Event", "EventTarget", "Performance"] }

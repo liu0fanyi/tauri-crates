@@ -1,0 +1,15 @@
+[package]
+name = "tauri-sync-db-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Backend dependencies - native only
+libsql = { version = "0.9", features = ["sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "fs"] }
+# Use tauri-plugin-http's reqwest to avoid rustls-platform-verifier issues on Android
+tauri-plugin-http = "2"
+hyper-rustls = { version = "0.25", features = ["http1", "http2", "webpki-tokio", "tls12"] }
+log = "0.4"
