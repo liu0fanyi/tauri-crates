@@ -1,370 +1,169 @@
-//! Backend synchronization logic for libsql/Turso
-//!
-//! Provides database initialization, cloud sync configuration, and connection management.
+//! Backend synchronization logic (Rusqlite version)
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use libsql::{Builder, Connection, Database};
+use tokio::sync::Mutex; 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use tokio::sync::Mutex;
+use std::fs;
+use tauri_plugin_http::reqwest;
+use serde_json::json;
 
-/// Sync configuration for Turso cloud database
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
     pub url: String,
     pub token: String,
 }
 
-/// Database state wrapper
 #[derive(Clone)]
 pub struct DbState {
-    db: Arc<Mutex<Option<Arc<Database>>>>,
-    conn: Arc<Mutex<Option<Connection>>>,
-    /// Whether cloud sync is enabled for this session
-    is_sync_enabled: Arc<Mutex<bool>>,
-    /// Current sync URL (for logging)
-    sync_url: Arc<Mutex<String>>,
+    // Use tokio Mutex for async compatibility
+    pub conn: Arc<Mutex<Option<Connection>>>,
+    pub db_path: PathBuf,
 }
 
 impl DbState {
-    pub fn new() -> Self {
+    pub fn new(db_path: PathBuf) -> Self {
         Self {
-            db: Arc::new(Mutex::new(None)),
             conn: Arc::new(Mutex::new(None)),
-            is_sync_enabled: Arc::new(Mutex::new(false)),
-            sync_url: Arc::new(Mutex::new(String::new())),
+            db_path,
         }
     }
 
-    /// Check if cloud sync is enabled for this session
-    pub async fn is_cloud_sync_enabled(&self) -> bool {
-        *self.is_sync_enabled.lock().await
-    }
-
-    /// Set sync enabled status and URL
-    pub async fn set_sync_config(&self, enabled: bool, url: String) {
-        *self.is_sync_enabled.lock().await = enabled;
-        *self.sync_url.lock().await = url;
-    }
-
-    /// Get current sync URL
-    pub async fn get_sync_url(&self) -> String {
-        self.sync_url.lock().await.clone()
-    }
-
-    /// Get a connection, initializing if necessary
-    pub async fn get_connection(&self) -> Result<Connection, String> {
+    pub async fn get_connection(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Connection>>, String> {
         let guard = self.conn.lock().await;
-        if let Some(conn) = &*guard {
-            return Ok(conn.clone());
+        if guard.is_none() {
+            return Err("Database not initialized".to_string());
         }
-        Err("Database not initialized".to_string())
+        Ok(guard)
     }
-
-    /// Manually trigger database sync (for cloud-synced databases)
-    pub async fn sync(&self) -> Result<(), String> {
-        let guard = self.db.lock().await;
-        if let Some(db) = &*guard {
-            db.sync().await.map_err(|e| {
-                let err_str = format!("{}", e);
-                if err_str.contains("File mode") || err_str.contains("not supported") {
-                    "云同步未启用。请先配置云同步并重启应用。".to_string()
-                } else {
-                    format!("同步失败: {}", e)
-                }
-            })?;
-            Ok(())
-        } else {
-            Err("数据库未初始化".to_string())
-        }
-    }
-
-    /// Close all connections and drop database
-    pub async fn close(&self) {
-        let mut db_guard = self.db.lock().await;
-        let mut conn_guard = self.conn.lock().await;
-        *conn_guard = None;
-        *db_guard = None;
-    }
-
-    /// Update this DbState's internals from another DbState (for async initialization)
-    pub async fn update_from(&self, other: &DbState) {
-        eprintln!("DbState::update_from: Starting state transfer");
-        let other_db = other.db.lock().await;
-        let other_conn = other.conn.lock().await;
-        let other_sync_enabled = other.is_sync_enabled.lock().await;
-        let other_sync_url = other.sync_url.lock().await;
-
-        eprintln!("DbState::update_from: Acquired locks, other_db is_some={}, other_conn is_some={}", 
-                 other_db.is_some(), other_conn.is_some());
-
-        *self.db.lock().await = other_db.clone();
-        *self.conn.lock().await = other_conn.clone();
-        *self.is_sync_enabled.lock().await = *other_sync_enabled;
-        *self.sync_url.lock().await = other_sync_url.clone();
-        
-        eprintln!("DbState::update_from: State transfer completed");
-    }
-}
-
-/// Get sync configuration file path
-fn get_config_path(db_path: &PathBuf) -> PathBuf {
-    db_path.parent().unwrap().join("sync_config.json")
-}
-
-/// Load sync configuration from file
-fn load_config(db_path: &PathBuf) -> Option<SyncConfig> {
-    let path = get_config_path(db_path);
-    if path.exists() {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            return serde_json::from_str(&content).ok();
-        }
-    }
-    None
-}
-
-/// Validate cloud connection with Turso
-pub async fn validate_cloud_connection(url: String, token: String) -> Result<(), String> {
-    log::info!("Validating cloud connection: url={}", url);
-
-    // Basic format check
-    if !url.starts_with("libsql://") && !url.starts_with("https://") {
-        log::error!("Invalid URL format: {}", url);
-        return Err("URL must start with libsql:// or https://".to_string());
-    }
-
-    // Convert libsql:// to https:// for HTTP check
-    let http_url = if url.starts_with("libsql://") {
-        url.replace("libsql://", "https://")
-    } else {
-        url.clone()
-    };
-
-    log::info!("HTTP URL: {}", http_url);
-    log::info!("Token length: {}", token.len());
-
-    // Use tauri-plugin-http's reqwest to avoid rustls-platform-verifier issues on Android
-    let client = tauri_plugin_http::reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| {
-            log::error!("Failed to build HTTP client: {}", e);
-            format!("Client build failed: {}", e)
-        })?;
-
-    // Standard LibSQL/Turso HTTP API expects POST with JSON statements
-    let query_body = serde_json::json!({
-        "statements": ["SELECT 1"]
-    });
-
-    log::info!("Sending validation request to: {}", http_url);
-
-    let body_str = serde_json::to_string(&query_body).map_err(|e| e.to_string())?;
-
-    let res = client.post(&http_url)
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .body(body_str)
-        .send()
-        .await;
-
-    let res = match res {
-        Ok(r) => {
-            log::info!("Request sent successfully");
-            r
-        }
-        Err(e) => {
-            log::error!("Request failed: {}", e);
-            return Err(format!("Connection failed: {}", e));
-        }
-    };
-
-    let status = res.status();
-    log::info!("Response status: {}", status);
-
-    if status == tauri_plugin_http::reqwest::StatusCode::UNAUTHORIZED 
-        || status == tauri_plugin_http::reqwest::StatusCode::FORBIDDEN {
-        log::error!("Authentication failed");
-        return Err("Authentication failed (Invalid Token)".to_string());
-    }
-
-    if !status.is_success() {
-        log::error!("Server returned error status: {}", status);
-        return Err(format!("Server returned error: {}", status));
-    }
-
-    log::info!("Cloud connection validated successfully");
-    Ok(())
-}
-
-/// Type alias for migration function
-pub type MigrationFn = fn(&Connection) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
-
-/// Initialize local database connection
-async fn init_local_db_connection(db_path_str: &str) -> Result<(Database, Connection, bool, String), String> {
-    let db = Builder::new_local(db_path_str)
-        .build()
-        .await
-        .map_err(|e| format!("Failed to build local db: {}", e))?;
-    let conn = db.connect().map_err(|e| format!("Failed to connect: {}", e))?;
-    Ok((db, conn, false, String::new()))
-}
-
-/// Initialize cloud database with auto-recovery on conflict
-async fn init_cloud_db_connection(db_path: &PathBuf, conf: SyncConfig) -> Result<(Database, Connection, bool, String), String> {
-    let db_path_str = db_path.to_str().ok_or("Invalid DB path")?;
-    let sync_url = conf.url.clone();
-    eprintln!("Initializing Synced DB: {}, token len: {}", conf.url, conf.token.len());
     
-    // Validate connection first
-    let validation_result = validate_cloud_connection(conf.url.clone(), conf.token.clone()).await;
-    
-    if let Err(e) = validation_result {
-        eprintln!("Cloud connection validation failed: {}", e);
-        eprintln!("Falling back to local mode due to invalid configuration.");
-        return init_local_db_connection(db_path_str).await;
-    }
-
-    // Try to initialize cloud connection
-    async fn try_build_connect(path: &str, url: String, token: String) -> Result<(Database, Connection), String> {
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .build();
-
-        let db = Builder::new_synced_database(path, url, token)
-            .connector(https)
-            .build()
-            .await
-            .map_err(|e| format!("Build failed: {}", e))?;
-        let conn = db.connect().map_err(|e| format!("Connect failed: {}", e))?;
-
-        // Force initial sync to detect conflicts immediately
-        db.sync().await.map_err(|e| format!("Initial sync failed: {}", e))?;
-
-        Ok((db, conn))
-    }
-
-    match try_build_connect(db_path_str, conf.url.clone(), conf.token.clone()).await {
-        Ok((db, conn)) => Ok((db, conn, true, sync_url.clone())),
-        Err(e) => {
-            eprintln!("Synced DB init failed: {}", e);
-
-            // Check for various sync conflict conditions
-            let should_recover = e.contains("local state is incorrect")
-                || e.contains("invalid local state")
-                || e.contains("server returned a conflict")
-                || e.contains("Generation ID mismatch")
-                || e.contains("mismatch")
-                || e.contains("metadata file does not");
-
-            eprintln!("Should auto-recover: {}", should_recover);
-
-            if should_recover {
-                eprintln!("Detected conflicting local DB state. Auto-recovering by wiping local DB...");
-
-                // Backup conflicting database
-                let conflict_path = db_path.with_extension("db.legacy");
-                if conflict_path.exists() {
-                    eprintln!("Removing old legacy backup: {:?}", conflict_path);
-                    let _ = std::fs::remove_file(&conflict_path);
-                }
-                if let Err(e) = std::fs::rename(&db_path, &conflict_path) {
-                    eprintln!("Rename to legacy failed: {} - removing instead", e);
-                    let _ = std::fs::remove_file(&db_path);
-                } else {
-                    eprintln!("Backed up old DB to: {:?}", conflict_path);
-                }
-
-                // Clean up sync metadata
-                eprintln!("Cleaning up sync metadata...");
-                let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-                let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
-
-                let sync_dir = db_path.parent().unwrap().join(format!("{}-sync", db_path.file_name().unwrap().to_str().unwrap()));
-                if sync_dir.exists() {
-                    eprintln!("Removing sync directory: {:?}", sync_dir);
-                    if sync_dir.is_dir() {
-                        let _ = std::fs::remove_dir_all(&sync_dir);
-                    } else {
-                        let _ = std::fs::remove_file(&sync_dir);
-                    }
-                }
-
-                eprintln!("Retrying with clean state...");
-                // Retry with clean state
-                match try_build_connect(db_path_str, conf.url, conf.token).await {
-                    Ok((db, conn)) => Ok((db, conn, true, sync_url.clone())),
-                    Err(e) => {
-                        eprintln!("Retry failed after recovery: {}", e);
-                        eprintln!("Falling back to local mode...");
-                        init_local_db_connection(db_path_str).await
-                    }
-                }
-            } else {
-                eprintln!("Cloud init failed (non-recoverable): {}", e);
-                eprintln!("Falling back to local mode...");
-                init_local_db_connection(db_path_str).await
-            }
-        }
+    /// Check if cloud sync is enabled (checked by presence of config)
+    pub fn is_cloud_sync_enabled(&self) -> bool {
+        get_sync_config(&self.db_path).is_some()
     }
 }
 
-/// Initialize database with custom migrations
-pub async fn init_db<F>(db_path: &PathBuf, migrations_fn: F) -> Result<DbState, String>
-where
-    F: for<'a> FnOnce(&'a Connection) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>,
-{
-    let db_path_str = db_path.to_str().ok_or("Invalid DB path")?;
+/// Initialize database connection
+pub async fn init_db(db_path: &PathBuf) -> Result<DbState, String> {
+    eprintln!("Initializing DB at: {:?}", db_path);
 
-    let config = load_config(db_path);
+    // Create directory if not exists
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
 
-    let (db, conn, is_cloud_sync, sync_url) = if let Some(conf) = config {
-        // Only use cloud sync if BOTH url and token are non-empty
-        if conf.url.is_empty() || conf.token.is_empty() {
-            eprintln!("Sync config has empty URL or token, falling back to local mode");
-            init_local_db_connection(db_path_str).await?
-        } else {
-            // Cloud sync mode
-            let msg = format!("Initializing Synced DB: {}, token len: {}", conf.url, conf.token.len());
-            eprintln!("{}", msg);
+    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    
+    // Set some PRAGMAs for better performance/safety
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA foreign_keys = ON;"
+    ).map_err(|e| e.to_string())?;
 
-            init_cloud_db_connection(db_path, conf).await?
-        }
-    } else {
-        // Local only mode
-        init_local_db_connection(db_path_str).await?
+    let state = DbState {
+        conn: Arc::new(Mutex::new(Some(conn))),
+        db_path: db_path.clone(),
     };
-
-    // Enable foreign keys
-    conn.execute("PRAGMA foreign_keys = ON", ())
-        .await
-        .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
-
-    // Run migrations
-    migrations_fn(&conn).await?;
-
-    let state = DbState::new();
-    *state.db.lock().await = Some(Arc::new(db));
-    *state.conn.lock().await = Some(conn);
-    state.set_sync_config(is_cloud_sync, sync_url).await;
-
+    
     Ok(state)
 }
 
-/// Configure cloud sync with Turso database
-pub async fn configure_sync(db_path: &PathBuf, url: String, token: String) -> Result<(), String> {
-    let config = SyncConfig { url, token };
-    let config_path = get_config_path(db_path);
-    std::fs::write(config_path, serde_json::to_string(&config).unwrap())
-        .map_err(|e| e.to_string())?;
+/// Initialize local-only database (same as init_db for Rusqlite)
+pub async fn init_local_only(db_path: &PathBuf) -> Result<DbState, String> {
+    init_db(db_path).await
+}
 
-    eprintln!("Sync config saved");
+pub fn load_config(db_path: &Path) -> Option<SyncConfig> {
+    let config_path = db_path.parent()?.join("sync_config.json");
+    if config_path.exists() {
+        let content = fs::read_to_string(config_path).ok()?;
+        serde_json::from_str(&content).ok()
+    } else {
+        None
+    }
+}
+
+pub async fn configure_sync(db_path: &Path, url: String, token: String) -> Result<(), String> {
+    let config = SyncConfig { url: url.clone(), token: token.clone() };
+    let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    
+    if let Some(parent) = db_path.parent() {
+        let config_path = parent.join("sync_config.json");
+        fs::write(config_path, json).map_err(|e| e.to_string())?;
+        
+        // Also validate connection if possible
+        let _ = validate_cloud_connection(url, token).await; 
+        
+        Ok(())
+    } else {
+        Err("Invalid database path".to_string())
+    }
+}
+
+pub fn get_sync_config(db_path: &PathBuf) -> Option<SyncConfig> {
+    load_config(db_path)
+}
+
+pub fn execute_sql(conn: &Connection, sql: &str) -> Result<(), String> {
+    conn.execute(sql, ()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Get current sync configuration
-pub fn get_sync_config(db_path: &PathBuf) -> Option<SyncConfig> {
-    load_config(db_path)
+/// Query and return rows as vector of optional strings
+pub fn query_strings(conn: &Connection, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let column_count = stmt.column_count();
+    
+    // Map each row to a Vec<Option<String>>
+    let rows = stmt.query_map([], |row| {
+        let mut row_vec = Vec::new();
+        for i in 0..column_count {
+            // Use rusqlite's dynamic value extraction
+            let val = match row.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => None,
+                rusqlite::types::ValueRef::Integer(i) => Some(i.to_string()),
+                rusqlite::types::ValueRef::Real(f) => Some(f.to_string()),
+                rusqlite::types::ValueRef::Text(t) => Some(String::from_utf8_lossy(t).to_string()),
+                rusqlite::types::ValueRef::Blob(_) => Some("<blob>".to_string()),
+            };
+            row_vec.push(val);
+        }
+        Ok(row_vec)
+    }).map_err(|e| e.to_string())?;
+    
+    let mut results = Vec::new();
+    for r in rows {
+        results.push(r.map_err(|e| e.to_string())?);
+    }
+    
+    Ok(results)
+}
+
+/// Validate connection to Turso (Cloud)
+pub async fn validate_cloud_connection(url: String, token: String) -> Result<(), String> {
+    eprintln!("Validating cloud connection to {}", url);
+    let http_url = url.replace("libsql://", "https://");
+    
+    let client = reqwest::Client::new();
+    
+    // Simple query to check connection
+    let body = json!({
+        "statements": ["SELECT 1"]
+    });
+    
+    let res = client.post(&http_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&body).map_err(|e| format!("Serialization failed: {}", e))?)
+        .send()
+        .await
+        .map_err(|e| format!("Network request failed: {}", e))?;
+        
+    if !res.status().is_success() {
+        return Err(format!("Auth failed: {}", res.status()));
+    }
+    
+    Ok(())
 }

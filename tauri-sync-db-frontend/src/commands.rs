@@ -31,7 +31,7 @@ pub async fn configure_cloud_sync(url: String, token: String) -> Result<(), Stri
     let args = serde_wasm_bindgen::to_value(&Args { url, token })
         .map_err(|e| format!("Serialization error: {}", e))?;
     
-    let promise = invoke("configure_cloud_sync", args);
+    let promise = invoke("configure_sync", args);
     let result = JsFuture::from(promise).await
         .map_err(|e| e.as_string().unwrap_or_else(|| format!("{:?}", e)))?;
     
@@ -41,7 +41,7 @@ pub async fn configure_cloud_sync(url: String, token: String) -> Result<(), Stri
 
 /// Get current sync configuration
 pub async fn get_cloud_sync_config() -> Result<Option<SyncConfig>, String> {
-    let promise = invoke("get_cloud_sync_config", JsValue::NULL);
+    let promise = invoke("get_sync_config", JsValue::NULL);
     let result = JsFuture::from(promise).await
         .map_err(|e| e.as_string().unwrap_or_else(|| format!("{:?}", e)))?;
     
@@ -60,7 +60,7 @@ pub async fn save_cloud_sync_config(url: String, token: String) -> Result<(), St
     let args = serde_wasm_bindgen::to_value(&Args { url, token })
         .map_err(|e| format!("Serialization error: {}", e))?;
     
-    let promise = invoke("save_cloud_sync_config", args);
+    let promise = invoke("configure_sync", args);
     let result = JsFuture::from(promise).await
         .map_err(|e| e.as_string().unwrap_or_else(|| format!("{:?}", e)))?;
     
@@ -70,7 +70,7 @@ pub async fn save_cloud_sync_config(url: String, token: String) -> Result<(), St
 
 /// Manually trigger database sync
 pub async fn sync_cloud_db() -> Result<(), String> {
-    let promise = invoke("sync_cloud_db", JsValue::NULL);
+    let promise = invoke("manual_sync", JsValue::NULL);
     let result = JsFuture::from(promise).await
         .map_err(|e| e.as_string().unwrap_or_else(|| format!("{:?}", e)))?;
     

@@ -105,7 +105,7 @@ pub fn SyncSettingsForm(
         is_syncing.set(true);
         
         spawn_local(async move {
-            match invoke_safe("sync_database", JsValue::NULL).await {
+            match invoke_safe("manual_sync", JsValue::NULL).await {
                 Ok(_) => {
                     message.set("同步成功！".to_string());
                     is_error.set(false);

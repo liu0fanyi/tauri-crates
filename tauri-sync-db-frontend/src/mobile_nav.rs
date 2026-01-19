@@ -43,7 +43,7 @@ pub fn SyncButton() -> impl IntoView {
         sync_state.set(SyncState::Syncing);
         
         spawn_local(async move {
-            match invoke_safe("sync_database", JsValue::NULL).await {
+            match invoke_safe("manual_sync", JsValue::NULL).await {
                 Ok(_) => {
                     sync_state.set(SyncState::Success);
                     // Reset to idle after 2 seconds
