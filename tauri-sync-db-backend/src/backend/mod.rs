@@ -53,14 +53,44 @@ pub async fn init_db(db_path: &PathBuf) -> Result<DbState, String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
-    let conn = Connection::open(db_path).map_err(|e| e.to_string())?;
+    // Try to open connection - this can fail if DB is malformed
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let err_msg = e.to_string();
+            eprintln!("Failed to open DB connection: {}", err_msg);
+             
+            // Diagnostic for open failure
+            if let Ok(metadata) = std::fs::metadata(db_path) {
+                return Err(format!("DB Open Failed: {}. File size: {} bytes. Image might be malformed.", err_msg, metadata.len()));
+            } else {
+                return Err(format!("DB Open Failed: {}. File does not exist or inaccessible.", err_msg));
+            }
+        }
+    };
     
     // Set some PRAGMAs for better performance/safety
-    conn.execute_batch(
+    if let Err(e) = conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;"
-    ).map_err(|e| e.to_string())?;
+    ) {
+        let err_msg = e.to_string();
+        eprintln!("Failed to set PRAGMAs: {}", err_msg);
+        
+        // Detailed diagnostics
+        let metadata = std::fs::metadata(db_path).map_err(|e| e.to_string())?;
+        eprintln!("DB File size: {} bytes", metadata.len());
+        
+        if metadata.len() > 0 {
+             let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap_or_else(|e| format!("Could not run integrity check: {}", e));
+             
+             return Err(format!("DB init failed: {}. Integrity check: {}. File size: {}", err_msg, integrity, metadata.len()));
+        } else {
+             return Err(format!("DB init failed: {}. File is empty.", err_msg));
+        }
+    }
 
     let state = DbState {
         conn: Arc::new(Mutex::new(Some(conn))),

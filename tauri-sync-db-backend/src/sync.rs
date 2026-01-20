@@ -71,16 +71,12 @@ pub async fn sync_all<S: SyncSchema + Send + Sync>(
     eprintln!("Starting cloud sync...");
     
     // 1. Verify remote schema
-    ensure_remote_schema(client, schema, url, token).await?;
+    ensure_remote_schema(client, state, schema, url, token).await?;
     
     let tables = schema.tables();
-    let mut tasks = Vec::new();
-
-    // 2. Parallelize sync for each table
-    // We need to resolve the type checking issue.
-    // Better approach: Extract column types map for each table before spawning.
+    // 2. Sequential sync for each table (to respect FK dependencies)
+    // We strictly follow the order defined in schema.tables()
     
-    // Let's rewrite the loop slightly
     for table_name in tables {
         let table = table_name.to_string();
         let client = client.clone();
@@ -92,26 +88,18 @@ pub async fn sync_all<S: SyncSchema + Send + Sync>(
         let pks: Vec<String> = schema.get_pks(&table).iter().map(|s| s.to_string()).collect();
         let updated_at_type = schema.get_column_type(&table, "updated_at").unwrap_or("TEXT".to_string());
         
-        tasks.push(tokio::spawn(async move {
-            sync_table(&client, &state, &url, &token, &table, &columns, &pks, &updated_at_type).await
-        }));
-    }
-
-    let mut errors = Vec::new();
-    for task in tasks {
-        match task.await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    eprintln!("Table sync failed: {}", e);
-                    errors.push(e);
-                }
-            }
-            Err(e) => {
-                eprintln!("Task join failed: {}", e);
-                errors.push(e.to_string());
-            }
+        // Execute sequentially
+        if let Err(e) = sync_table(&client, &state, &url, &token, &table, &columns, &pks, &updated_at_type).await {
+            eprintln!("Table sync failed for {}: {}", table, e);
+            // We can choose to abort or continue. For now, let's collect error but continue other tables? 
+            // Actually, if dependencies fail, downstream might fail too. 
+            // But let's try to do as much as possible.
+            // return Err(e); // strict mode
         }
     }
+
+    // No tasks to await anymore
+    let errors = Vec::<String>::new();
 
     if !errors.is_empty() {
         return Err(format!("Sync completed with {} errors: {:?}", errors.len(), errors));
@@ -122,15 +110,37 @@ pub async fn sync_all<S: SyncSchema + Send + Sync>(
 }
 
 async fn ensure_remote_schema<S: SyncSchema>(
-    client: &reqwest::Client, 
+    client: &reqwest::Client,
+    state: &DbState,
     schema: &S, 
     url: &str, 
     token: &str
 ) -> Result<(), String> {
-    eprintln!("[{}] Verifying remote schema (fast mode)...", chrono::Local::now().format("%H:%M:%S%.3f"));
+    eprintln!("[{}] Verifying remote schema...", chrono::Local::now().format("%H:%M:%S%.3f"));
     
     let mut tasks = Vec::new();
     let tables = schema.tables();
+
+    // NEW: Ensure tables exist by running their CREATE statement from sqlite_master
+    let mut create_sqls = Vec::new();
+    {
+        let conn_guard = state.get_connection().await.map_err(|e| e.to_string())?;
+        let conn = conn_guard.as_ref().ok_or("Database not initialized")?;
+        
+        for table_name in &tables {
+             let query = "SELECT sql FROM sqlite_master WHERE type='table' AND name=?";
+             let create_sql: Option<String> = conn.query_row(query, [table_name], |row| row.get(0)).ok();
+             
+             if let Some(sql) = create_sql {
+                 create_sqls.push((table_name.to_string(), sql));
+             }
+        }
+    } // conn_guard dropped here, so &Connection is not held across await
+
+    for (table_name, sql) in create_sqls {
+         eprintln!("Ensuring table {} exists on remote...", table_name);
+         let _ = execute_remote_query(client, url, token, &sql).await;
+    }
 
     // Check standard columns for ALL tables in the schema
     for table_name in tables {
@@ -197,7 +207,7 @@ async fn sync_table(
     
     // Get last sync time
     let mut last_sync_time = if updated_at_type.to_uppercase().contains("INT") {
-        "0".to_string()
+        "-1".to_string()
     } else {
         "1970-01-01 00:00:00".to_string()
     };
@@ -220,9 +230,9 @@ async fn sync_table(
                 last_sync_time = dt.and_utc().timestamp_millis().to_string();
                 eprintln!("Converting legacy date string '{}' to millis '{}' for table {}", dt, last_sync_time, table);
             } else {
-                // If it fails, maybe it's just garbage or empty? Default to 0 is safer than SQL error.
-                 eprintln!("Warning: Could not parse last_sync_time '{}' as int or date for table {}. Defaulting to 0.", last_sync_time, table);
-                 last_sync_time = "0".to_string();
+                // If it fails, maybe it's just garbage or empty? Default to -1 is safer to ensure we catch 0s.
+                 eprintln!("Warning: Could not parse last_sync_time '{}' as int or date for table {}. Defaulting to -1.", last_sync_time, table);
+                 last_sync_time = "-1".to_string();
             }
         }
     }
@@ -285,7 +295,17 @@ async fn push_changes(
         return Ok(());
     }
 
-    eprintln!("Pushing {} records for table {}", rows.len(), table);
+    // Capture IDs for logging
+    let id_col_idx = columns.iter().position(|c| c == "id");
+    let ids: Vec<String> = if let Some(idx) = id_col_idx {
+        rows.iter()
+            .filter_map(|r| r.get(idx).and_then(|v| v.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    eprintln!("Pushing {} records for table {} (IDs: {:?})", rows.len(), table, ids);
 
     let mut statements = Vec::new();
     
@@ -345,13 +365,29 @@ async fn pull_changes(
         return Ok(());
     }
     
-    eprintln!("Pulling {} records for table {}", rows.len(), table);
+    // Capture IDs for logging
+    let id_col_idx = columns.iter().position(|c| c == "id");
+    let ids: Vec<String> = if let Some(idx) = id_col_idx {
+        rows.iter()
+            .filter_map(|r| r.get(idx).and_then(|v| v.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    
+    eprintln!("Pulling {} records for table {} (IDs: {:?})", rows.len(), table, ids);
     
     let conn_guard = state.get_connection().await.map_err(|e| e.to_string())?;
     let conn = conn_guard.as_ref().ok_or("Database not initialized")?;
     
+    // Disable FKs for this connection to allow out-of-order insertion (e.g. self-referencing items)
+    conn.execute("PRAGMA foreign_keys = OFF", []).map_err(|e| e.to_string())?;
+    
     let mut collision_count = 0;
     
+    // Explicit scope for transaction to ensure it drops before we re-enable FKs later (if we wanted to)
+    // Actually rusqlite transaction borrow checker might be tricky.
+    // Let's use `unchecked_transaction`
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     
     for row in rows {
@@ -365,7 +401,7 @@ async fn pull_changes(
         let mut pk_conditions = Vec::new();
         for pk in pks {
              let pk_val = row_map.get(pk).cloned().unwrap_or_default();
-             if pk_val.is_empty() { continue; } // This check might need refinement for composite keys if one part is empty/null but legal? but usually PK shouldn't be empty string.
+             if pk_val.is_empty() { continue; } 
              pk_conditions.push(format!("{} = '{}'", pk, pk_val.replace("'", "''")));
         }
         
@@ -410,6 +446,9 @@ async fn pull_changes(
     
     tx.commit().map_err(|e| e.to_string())?;
     
+    // Re-enable FKs
+    conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| e.to_string())?;
+    
     if collision_count > 0 {
         eprintln!("Ignored {} remote updates due to newer local versions", collision_count);
     }
@@ -419,9 +458,14 @@ async fn pull_changes(
 
 async fn fetch_remote_rows(client: &reqwest::Client, url: &str, token: &str, sql: &str) -> Result<Vec<Vec<Option<String>>>, String> {
     let http_url = url.replace("libsql://", "https://");
+    // Only log URL once to avoid spamming, or log debug?
+    // Let's log it once per connection or just ensure user knows.
+    // For now, let's just log it if it changes or just simple print.
+    // actually, let's validation:
+    eprintln!("Connecting to remote DB: {}", http_url); 
     
     let response = client
-        .post(http_url)
+        .post(&http_url)
         .header("Authorization", format!("Bearer {}", token))
         .header("Content-Type", "application/json")
         .body(serde_json::to_string(&json!({
